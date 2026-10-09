@@ -42,6 +42,25 @@ public class SimdJsonParserPoolTests extends SimdJsonTestCase {
         assertEquals(walkJson(json), handler.events);
     }
 
+    public void testTruncatedDocumentThrowsParsingException() {
+        JsonDocumentParser docParser = newPool().forCurrentThread();
+        byte[] truncated = "{\"a\":".getBytes(UTF_8);
+        expectThrows(JsonParsingException.class, () -> docParser.parseDocument(truncated, truncated.length, new RecordingHandler(false)));
+    }
+
+    public void testTruncatedDocumentWalksStaleIndexesOfPreviousDocument() {
+        JsonDocumentParser docParser = newPool().forCurrentThread();
+        byte[] previous = "{\"a\":1,\"b\":2,\"c\":3}".getBytes(UTF_8);
+        docParser.parseDocument(previous, previous.length, new RecordingHandler(false));
+
+        byte[] truncated = "{\"s\":\"}}}}}}}}}}\",\"y\":".getBytes(UTF_8);
+        RecordingHandler handler = new RecordingHandler(false);
+        try {
+            docParser.parseDocument(truncated, truncated.length, handler);
+            fail("truncated document parsed as " + handler.events);
+        } catch (JsonParsingException expected) {}
+    }
+
     public void testParseDocumentRejectsOversizedDocument() {
         JsonDocumentParser docParser = newPool().forCurrentThread();
         int tooLarge = docParser.maxDocumentBytes() + 1;

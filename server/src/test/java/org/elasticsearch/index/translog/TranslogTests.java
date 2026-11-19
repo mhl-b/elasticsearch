@@ -46,7 +46,9 @@ import org.elasticsearch.common.util.concurrent.AbstractRunnable;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
 import org.elasticsearch.common.xcontent.XContentHelper;
 import org.elasticsearch.core.Assertions;
+import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.IOUtils;
+import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.IndexVersion;
@@ -114,7 +116,9 @@ import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.Phaser;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -2768,6 +2772,147 @@ public class TranslogTests extends ESTestCase {
         }
     }
 
+    public void testAppendDuringReaderDeletion() throws Exception {
+        final var config = getTranslogConfig(createTempDir());
+        final var path = config.getTranslogPath();
+        final var deletionStarted = new CountDownLatch(1);
+        final var releaseDeletion = new CountDownLatch(1);
+        try (var translog = newTranslogForTrimming(config, generation -> {
+            if (generation == 1) {
+                deletionStarted.countDown();
+                safeAwait(releaseDeletion, TimeValue.THIRTY_SECONDS);
+            }
+        })) {
+            prepareReadersForTrimming(translog);
+            final var trim = new FutureTask<Void>(() -> {
+                translog.trimUnreferencedReaders();
+                return null;
+            });
+            final var trimThread = Thread.ofPlatform().name("trim").start(trim);
+            try {
+                safeAwait(deletionStarted);
+                assertEquals(2L, Translog.readCheckpoint(path).minTranslogGeneration);
+                final var append = new FutureTask<>(() -> translog.add(indexOp("new", 1, primaryTerm.get())));
+                Thread.ofPlatform().name("append").start(append);
+                assertEquals(3L, append.get(10, TimeUnit.SECONDS).generation());
+
+                final var concurrentTrim = new FutureTask<Void>(() -> {
+                    translog.trimUnreferencedReaders();
+                    return null;
+                });
+                Thread.ofPlatform().name("concurrent-trim").start(concurrentTrim);
+                concurrentTrim.get(10, TimeUnit.SECONDS);
+                assertEquals(2L, Translog.readCheckpoint(path).minTranslogGeneration);
+                assertFileIsPresent(translog, 2L);
+            } finally {
+                releaseDeletion.countDown();
+                safeJoin(trimThread);
+            }
+            trim.get(10, TimeUnit.SECONDS);
+            assertEquals(3L, Translog.readCheckpoint(path).minTranslogGeneration);
+            assertFileDeleted(translog, 1L);
+            assertFileDeleted(translog, 2L);
+        }
+    }
+
+    public void testRetryPartialReaderDeletionBeforeRetiringNextReader() throws IOException {
+        final var config = getTranslogConfig(createTempDir());
+        final var path = config.getTranslogPath();
+        final var checkpoint = path.resolve(Translog.getCommitCheckpointFileName(1));
+        final var failDeletion = new AtomicBoolean(true);
+        try (var translog = newTranslogForTrimming(config, generation -> {
+            if (generation == 1 && failDeletion.getAndSet(false)) {
+                Files.delete(path.resolve(Translog.getFilename(generation)));
+                throw new IOException("simulated checkpoint unlink failure");
+            }
+        })) {
+            prepareReadersForTrimming(translog);
+            translog.trimUnreferencedReaders();
+            assertEquals(2L, Translog.readCheckpoint(path).minTranslogGeneration);
+            assertFileDeleted(translog, 1L);
+            assertTrue(Files.exists(checkpoint));
+            assertFileIsPresent(translog, 2L);
+
+            translog.trimUnreferencedReaders();
+            assertEquals(3L, Translog.readCheckpoint(path).minTranslogGeneration);
+            assertTrue(Files.notExists(checkpoint));
+            assertFileDeleted(translog, 2L);
+        }
+    }
+
+    public void testReplacingTranslogWaitsForPendingDeletion() throws Exception {
+        final var config = getTranslogConfig(createTempDir());
+        final var path = config.getTranslogPath();
+        final var deletionStarted = new CountDownLatch(1);
+        final var releaseDeletion = new CountDownLatch(1);
+        final var closed = new CountDownLatch(1);
+        try (var translog = newTranslogForTrimming(config, generation -> {
+            if (generation == 1) {
+                deletionStarted.countDown();
+                safeAwait(releaseDeletion, TimeValue.THIRTY_SECONDS);
+            }
+        })) {
+            prepareReadersForTrimming(translog);
+            final var trim = new FutureTask<Void>(() -> {
+                translog.trimUnreferencedReaders();
+                return null;
+            });
+            final var trimThread = Thread.ofPlatform().name("trim").start(trim);
+            final var reset = new FutureTask<>(() -> {
+                translog.close();
+                closed.countDown();
+                return Translog.createEmptyTranslog(path, SequenceNumbers.NO_OPS_PERFORMED, shardId, primaryTerm.get());
+            });
+            final var resetThread = Thread.ofPlatform().name("reset").unstarted(reset);
+            try {
+                safeAwait(deletionStarted);
+                resetThread.start();
+                safeAwait(closed);
+                assertBusy(() -> assertEquals(Thread.State.WAITING, resetThread.getState()));
+                assertEquals(2L, Translog.readCheckpoint(path).minTranslogGeneration);
+            } finally {
+                releaseDeletion.countDown();
+                safeJoin(trimThread);
+                safeJoin(resetThread);
+            }
+            trim.get(10, TimeUnit.SECONDS);
+            final String uuid = reset.get(10, TimeUnit.SECONDS);
+            assertNotEquals(translog.getTranslogUUID(), uuid);
+            assertEquals(1L, Translog.readCheckpoint(path).minTranslogGeneration);
+            assertFileIsPresent(translog, 1L);
+        }
+    }
+
+    private Translog newTranslogForTrimming(TranslogConfig config, CheckedConsumer<Long, IOException> beforeDelete) throws IOException {
+        final var uuid = Translog.createEmptyTranslog(
+            config.getTranslogPath(),
+            SequenceNumbers.NO_OPS_PERFORMED,
+            shardId,
+            primaryTerm.get()
+        );
+        return new Translog(
+            config,
+            uuid,
+            new TranslogDeletionPolicy(),
+            () -> SequenceNumbers.NO_OPS_PERFORMED,
+            primaryTerm::get,
+            seqNo -> {},
+            TranslogOperationAsserter.DEFAULT
+        ) {
+            @Override
+            void deleteReaderFiles(long generation) throws IOException {
+                beforeDelete.accept(generation);
+                super.deleteReaderFiles(generation);
+            }
+        };
+    }
+
+    private void prepareReadersForTrimming(Translog translog) throws IOException {
+        translog.add(indexOp("committed", 0, primaryTerm.get()));
+        translog.rollGeneration();
+        translog.getDeletionPolicy().setLocalCheckpointOfSafeCommit(0);
+    }
+
     /**
      * Tests the situation where the node crashes after a translog gen was committed to lucene, but before the translog had the chance
      * to clean up its files.
@@ -2938,12 +3083,12 @@ public class TranslogTests extends ESTestCase {
             }
 
             @Override
-            void deleteReaderFiles(TranslogReader reader) {
+            void deleteReaderFiles(long generation) throws IOException {
                 if (fail.fail()) {
                     // simulate going OOM and dying just at the wrong moment.
                     throw new RuntimeException("simulated");
                 } else {
-                    super.deleteReaderFiles(reader);
+                    super.deleteReaderFiles(generation);
                 }
             }
         };
